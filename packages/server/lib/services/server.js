@@ -1113,6 +1113,22 @@ function handleUploadRequest(req, res) {
 
     const dst = utils.addFilesPath(path.join(dstDir, tmpPath));
 
+    const CHUNKSIZE_MB = 100;
+    const THRESHOLD_BYTES = CHUNKSIZE_MB * 1024 * 1024;
+
+    let uploadedBytes = 0;
+    let nextLogThreshold = THRESHOLD_BYTES;
+
+    file.on('data', (chunk) => {
+      uploadedBytes += chunk.length;
+
+      if(uploadedBytes >= nextLogThreshold){
+        const mb = (uploadedBytes / (1024*1024)).toFixed(1);
+        log.info(`Uploading... ${filename}: ${mb}MB done.`);
+        nextLogThreshold += THRESHOLD_BYTES;
+      }
+    });
+
     utils.mkdir(path.dirname(dst)).then(async () => {
       try {
 
