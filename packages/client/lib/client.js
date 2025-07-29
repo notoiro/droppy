@@ -720,7 +720,156 @@ function uploadBlob(view, blob) {
   upload(view, fd, [name]);
 }
 
-function upload(view, fd, files) {
+async function upload(view, fd, files){
+  // 1GB以上なら分割
+  if(true || files.some(file => file.size > 1024 * 1024 * 1024)){
+    return uploadChunkd(view, fd, files);
+  }else{
+    return uploadLegacy(view, fd, files);
+  }
+}
+
+async function uploadChunkd(view, fd, files) {
+  let rename = false;
+  if (view[0].currentData && Object.keys(view[0].currentData).length) {
+    let conflict = false;
+    const existingFiles = Object.keys(view[0].currentData);
+    files.some((file) => {
+      if (existingFiles.includes(file)) {
+        conflict = true;
+        return true;
+      }
+    });
+    if (conflict) {
+      rename = !window.confirm(
+        "Some of the uploaded files already exist. Overwrite them?"
+      );
+    }
+  }
+
+  if (!files || !files.length) return showError(view, "Unable to upload.");
+  const id = (view[0].uploadId += 1);
+  const sessionId = `${id}_${Date.now()}`;
+  let isAborted = false;
+
+  // Render upload bar
+  $(
+    Handlebars.templates["upload-info"]({
+      id,
+      title: files.length === 1 ? basename(files[0]) : `${files.length} files`,
+    })
+  )
+    .appendTo(view)
+    .transition("in")
+    .find(".upload-cancel")
+    .off("click")
+    .on("click", () => {
+      isAborted = true;
+      uploadCancel(view, id);
+    });
+
+  view[0].isUploading = true;
+  view[0].uploadStart = performance.now();
+
+  try {
+    // FormDataから実際のFileオブジェクトを取得
+    const fileObjects = [];
+    for (let pair of fd.entries()) {
+      if (pair[1] instanceof File) {
+        fileObjects.push(pair[1]);
+      }
+    }
+
+    let totalBytes = 0;
+    let uploadedBytes = 0;
+
+    // 全ファイルの総サイズを計算
+    fileObjects.forEach(file => {
+      totalBytes += file.size;
+    });
+
+    // 各ファイルを分割アップロード
+    for (const file of fileObjects) {
+      if (isAborted) break;
+
+      const result = await uploadFileInChunks(
+        file,
+        view,
+        sessionId,
+        rename,
+        (loaded) => {
+          // 個別ファイルの進捗を全体の進捗に反映
+          uploadProgress(view, id, uploadedBytes + loaded, totalBytes);
+        }
+      );
+
+      if (!result.success) {
+        throw new Error(result.error || 'Upload failed');
+      }
+
+      uploadedBytes += file.size;
+    }
+
+    if (!isAborted) {
+      uploadSuccess(id);
+    }
+  } catch (error) {
+    if (!isAborted) {
+      showError(view, error.message || "An error occurred during upload.");
+      uploadCancel(view, id);
+    }
+  } finally {
+    uploadFinish(view, id);
+  }
+}
+
+async function uploadFileInChunks(file, view, sessionId, rename, onProgress) {
+  const chunkSize = (1024 * 1024) * 100; // 100MB chunks
+  const totalChunks = Math.ceil(file.size / chunkSize);
+  let uploadedBytes = 0;
+
+  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+    const start = chunkIndex * chunkSize;
+    const end = Math.min(start + chunkSize, file.size);
+    const chunk = file.slice(start, end);
+
+    const chunkFormData = new FormData();
+    chunkFormData.append('fileName', file.name);
+    chunkFormData.append('chunkIndex', chunkIndex);
+    chunkFormData.append('totalChunks', totalChunks);
+    chunkFormData.append('sessionId', sessionId);
+    chunkFormData.append('chunk', chunk);
+
+    try {
+      const response = await fetch(
+        `${getRootPath()}!/upload-chunk?vId=${view[0].vId}&to=${encodeURIComponent(
+          view[0].currentFolder
+        )}&rename=${rename ? "1" : "0"}`,
+        {
+          method: 'POST',
+          body: chunkFormData
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Server responded with HTTP ${response.status}`);
+      }
+
+      uploadedBytes += chunk.size;
+      if (onProgress) {
+        onProgress(uploadedBytes);
+      }
+
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  return { success: true };
+}
+
+// 従来のXMLHttpRequest版をバックアップとして保持
+function uploadLegacy(view, fd, files) {
   let rename = false;
   if (view[0].currentData && Object.keys(view[0].currentData).length) {
     let conflict = false;
@@ -1386,7 +1535,7 @@ function openDirectory(view, data, isSearch) {
 
         if (selectedItems.length === 0) {
           selects.each(function (_, el) {
-            // trigger a change on el 
+            // trigger a change on el
             el.checked = true;
             el.dispatchEvent(new Event('change'));
           });

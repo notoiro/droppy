@@ -45,6 +45,8 @@ let firstRun = null;
 let ready = false;
 let dieOnError = true;
 
+const uploadSessions = new Map();
+
 const setView = (sid, vId, view) => {
   clients[sid].views[vId] = view;
 };
@@ -820,7 +822,9 @@ function handlePOST(req, res) {
     return;
   }
 
-  if (/^\/!\/upload/.test(URI)) {
+  if(/^\/!\/upload-chunk/.test(URI)) {
+    handleChunkUploadRequest(req, res);
+  } else if (/^\/!\/upload/.test(URI)) {
     handleUploadRequest(req, res);
   } else if (/^\/!\/logout$/.test(URI)) {
     res.setHeader("Content-Type", "text/plain");
@@ -1013,6 +1017,353 @@ async function handleTypeRequest(req, res, file) {
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.end(isBinary ? "binary" : "text");
   log.info(req, res);
+}
+
+function handleChunkUploadRequest(req, res) {
+  if (config.readOnly) {
+    res.statusCode = 403;
+    res.end();
+    log.info(req, res, "Upload cancelled because of read-only mode");
+    return;
+  }
+
+  // タイムアウト設定を最適化
+  const timeout = Math.max(config.uploadTimeout, 30000); // 最低30秒
+  if (req.setTimeout) req.setTimeout(timeout);
+  if (req.connection.setTimeout) req.connection.setTimeout(timeout);
+  if (res.setTimeout) res.setTimeout(timeout);
+
+  // URLパラメータの解析
+  const urlParts = req.url.split('?');
+  const queryString = urlParts[1] || '';
+  req.query = Object.fromEntries(new URLSearchParams(queryString));
+
+  const vId = req.query.vId;
+
+  if (!req.query || !req.query.to) {
+    res.statusCode = 500;
+    res.end();
+    return;
+  }
+
+  Object.keys(clients).some((sid) => {
+    if (clients[sid].cookie === cookies.get(req.headers.cookie)) {
+      req.sid = sid;
+      return true;
+    }
+  });
+
+  const dstDir = decodeURIComponent(req.query.to) || clients[req.sid].views[vId].directory;
+
+  // 高速multipart解析
+  parseMultipartFormData(req, (err, fields, files) => {
+    if (err) {
+      log.error(req, res, err);
+      res.statusCode = 400;
+      res.end();
+      return;
+    }
+
+    processChunkData(fields, files, dstDir, req, res, vId);
+  });
+}
+
+function parseMultipartFormData(req, callback) {
+  const contentType = req.headers['content-type'];
+  if (!contentType || !contentType.includes('multipart/form-data')) {
+    return callback(new Error('Content-Type must be multipart/form-data'));
+  }
+
+  const boundary = contentType.split('boundary=')[1]?.replace(/"/g, '');
+  if (!boundary) {
+    return callback(new Error('No boundary found'));
+  }
+
+  const boundaryBytes = Buffer.from(`--${boundary}`);
+  const doublecrlfBytes = Buffer.from('\r\n\r\n');
+
+  let buffer = Buffer.alloc(0);
+  const fields = {};
+  const files = {};
+
+  // ストリーミング処理で大きなチャンクを効率的に処理
+  const chunks = [];
+  let totalLength = 0;
+
+  req.on('data', (chunk) => {
+    chunks.push(chunk);
+    totalLength += chunk.length;
+  });
+
+  req.on('end', () => {
+    try {
+      // 一度にBufferを結合（高速）
+      buffer = Buffer.concat(chunks, totalLength);
+
+      // 最初のboundaryを検索
+      let pos = buffer.indexOf(boundaryBytes);
+      if (pos === -1) return callback(new Error('Invalid multipart data'));
+
+      while (pos !== -1) {
+        // 次のboundaryを検索
+        const nextPos = buffer.indexOf(boundaryBytes, pos + boundaryBytes.length);
+        const endPos = nextPos === -1 ? buffer.length : nextPos;
+
+        // パートを抽出
+        const partStart = pos + boundaryBytes.length;
+        let part = buffer.slice(partStart, endPos);
+
+        // CRLFをスキップ
+        if (part.length >= 2 && part[0] === 0x0D && part[1] === 0x0A) {
+          part = part.slice(2);
+        }
+
+        if (part.length > 0) {
+          const headerEnd = part.indexOf(doublecrlfBytes);
+          if (headerEnd !== -1) {
+            const headers = part.slice(0, headerEnd).toString('ascii');
+            let body = part.slice(headerEnd + 4);
+
+            // 末尾のCRLFを除去
+            if (body.length >= 2 &&
+                body[body.length - 2] === 0x0D &&
+                body[body.length - 1] === 0x0A) {
+              body = body.slice(0, -2);
+            }
+
+            const nameMatch = headers.match(/name="([^"]+)"/);
+            if (nameMatch) {
+              const fieldName = nameMatch[1];
+
+              if (headers.includes('filename=')) {
+                files[fieldName] = body;
+              } else {
+                fields[fieldName] = body.toString('utf8');
+              }
+            }
+          }
+        }
+
+        pos = nextPos;
+      }
+
+      callback(null, fields, files);
+    } catch (error) {
+      callback(error);
+    }
+  });
+
+  req.on('error', callback);
+}
+
+async function processChunkData(fields, files, dstDir, req, res, vId) {
+  const chunkIndex = parseInt(fields.chunkIndex);
+  const totalChunks = parseInt(fields.totalChunks);
+  const fileName = fields.fileName;
+  const sessionId = fields.sessionId;
+  const chunkData = files.chunk;
+
+  if (!fileName || chunkIndex === null || totalChunks === null || sessionId === null || !chunkData) {
+    res.statusCode = 400;
+    res.end('Missing chunk data');
+    return;
+  }
+
+  if (!utils.isPathSane(fileName) || !utils.isPathSane(dstDir)) {
+    res.statusCode = 400;
+    res.end('Invalid path');
+    return;
+  }
+
+  try {
+    const result = await processChunk(sessionId, fileName, chunkIndex, totalChunks, chunkData, dstDir, req);
+
+    // レスポンスを即座に返す（ファイルI/O完了を待たない）
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Connection', 'close');
+    res.end(JSON.stringify({
+      received: chunkIndex,
+      processed: result.processedChunks,
+      isComplete: result.isComplete
+    }));
+
+    if (result.isComplete) {
+      // バックグラウンドでファイナライズ処理
+      setImmediate(() => {
+        filetree.updateDir(dstDir);
+        log.info(req, res, `Upload completed: ${fileName}`);
+      });
+    }
+
+  } catch (error) {
+    log.error(req, res, error);
+    res.statusCode = 500;
+    res.end();
+  }
+}
+
+async function processChunk(sessionId, fileName, chunkIndex, totalChunks, chunkData, dstDir, req) {
+  // セッション初期化（キャッシュ最適化）
+  let session = uploadSessions.get(sessionId);
+  if (!session) {
+    const tmpPath = utils.addUploadTempExt(fileName);
+    const tempFilePath = utils.addFilesPath(path.join(dstDir, tmpPath));
+
+    // ディレクトリ作成を並列化
+    await utils.mkdir(path.dirname(tempFilePath));
+
+    session = {
+      fileName,
+      totalChunks,
+      nextExpectedChunk: 0,
+      tempFilePath,
+      finalPath: path.join(dstDir, fileName),
+      tempChunkDir: utils.addFilesPath(path.join(dstDir, `.chunks_${sessionId}`)),
+      receivedChunks: new Set(),
+      writeStream: null,
+      pendingWrites: new Map() // 非同期書き込みキュー
+    };
+
+    uploadSessions.set(sessionId, session);
+
+    // チャンク一時ディレクトリを並列作成
+    await utils.mkdir(session.tempChunkDir);
+  }
+
+  session.receivedChunks.add(chunkIndex);
+
+  // 順序通りのチャンクの場合
+  if (chunkIndex === session.nextExpectedChunk) {
+    if (!session.writeStream) {
+      session.writeStream = createWriteStream(session.tempFilePath, {
+        mode: "644",
+        highWaterMark: 64 * 1024 // 64KB buffer for better performance
+      });
+    }
+
+    // 非ブロッキング書き込み
+    session.writeStream.write(chunkData);
+    session.nextExpectedChunk++;
+
+    // 待機中のチャンクを高速処理
+    await processWaitingChunks(session);
+  } else {
+    // 順序外チャンクの非同期保存
+    const tempChunkPath = path.join(session.tempChunkDir, `chunk_${chunkIndex}`);
+
+    // 非ブロッキングファイル書き込み
+    setImmediate(() => {
+      fs.writeFile(tempChunkPath, chunkData, (err) => {
+        if (err) log.error(`Error saving chunk ${chunkIndex}: ${err.message}`);
+      });
+    });
+  }
+
+  // 完了チェック
+  const isComplete = session.nextExpectedChunk === totalChunks;
+
+  if (isComplete) {
+    // 非ブロッキングでファイナライズ
+    setImmediate(() => finalizeUpload(sessionId, session, req));
+  }
+
+  return {
+    processedChunks: session.nextExpectedChunk,
+    isComplete
+  };
+}
+
+async function processWaitingChunks(session) {
+  // バッチでチャンクを処理
+  const batchSize = 5;
+  let processed = 0;
+
+  while (session.nextExpectedChunk < session.totalChunks &&
+         session.receivedChunks.has(session.nextExpectedChunk) &&
+         processed < batchSize) {
+
+    const chunkPath = path.join(session.tempChunkDir, `chunk_${session.nextExpectedChunk}`);
+
+    try {
+      const chunkData = await fs.readFile(chunkPath);
+      session.writeStream.write(chunkData);
+
+      // 非同期でファイル削除
+      setImmediate(() => {
+        fs.unlink(chunkPath, (err) => {
+          if (err) log.error(`Error deleting chunk: ${err.message}`);
+        });
+      });
+
+      session.nextExpectedChunk++;
+      processed++;
+    } catch (error) {
+      break; // チャンクがまだ保存されていない
+    }
+  }
+}
+
+async function finalizeUpload(sessionId, session, req) {
+  try {
+    if (session.writeStream && !session.writeStream.destroyed) {
+      session.writeStream.end();
+    }
+
+    // 最終ファイル移動
+    const finalDst = utils.addFilesPath(session.finalPath);
+
+    try {
+      await fs.stat(finalDst);
+      if (req.query.rename === "1") {
+        await new Promise((resolve) => {
+          utils.getNewPath(finalDst, async (newDst) => {
+            await promisify(utils.move)(session.tempFilePath, newDst);
+            resolve();
+          });
+        });
+      } else {
+        await promisify(utils.move)(session.tempFilePath, finalDst);
+      }
+    } catch (err) {
+      if (err?.code === "ENOENT") {
+        await promisify(utils.move)(session.tempFilePath, finalDst);
+      }
+    }
+
+    // クリーンアップ
+    await cleanupSession(sessionId);
+
+  } catch (error) {
+    log.error(`Finalization error: ${error.message}`);
+    await cleanupSession(sessionId, true);
+  }
+}
+
+async function cleanupSession(sessionId, isError = false) {
+  const session = uploadSessions.get(sessionId);
+  if (!session) return;
+
+  // 非同期でクリーンアップ
+  setImmediate(async () => {
+    try {
+      if (session.writeStream && !session.writeStream.destroyed) {
+        session.writeStream.destroy();
+      }
+
+      if (isError && session.tempFilePath) {
+        await fs.unlink(session.tempFilePath).catch(() => {});
+      }
+
+      if (session.tempChunkDir) {
+        await promisify(utils.rmdir)(session.tempChunkDir).catch(() => {});
+      }
+    } catch (error) {
+      log.error(`Cleanup error: ${error.message}`);
+    }
+  });
+
+  uploadSessions.delete(sessionId);
 }
 
 function handleUploadRequest(req, res) {
