@@ -824,7 +824,7 @@ async function uploadChunkd(view, fd, files) {
 }
 
 async function uploadFileInChunks(file, view, sessionId, rename, onProgress) {
-  const chunkSize = (1024 * 1024) * 100; // 100MB chunks
+  const chunkSize = (1024 * 1024) * 50; // 50MB chunks
   const totalChunks = Math.ceil(file.size / chunkSize);
   let uploadedBytes = 0;
 
